@@ -2,6 +2,10 @@ import streamlit as st
 import sqlite3
 from datetime import datetime
 import pandas as pd
+import scipy.stats as stats
+import numpy as np
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
 
 
 # БАЗА ДАННЫХ
@@ -49,6 +53,16 @@ def init_db():
             spend REAL,
             revenue REAL,
             date TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS survey_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER,
+            question TEXT,
+            answer TEXT,
+            date TEXT,
+            FOREIGN KEY(client_id) REFERENCES clients(id)
         )
     """)
     conn.commit()
@@ -272,13 +286,36 @@ def get_ad_channels():
     conn.close()
     return channels
 
+def add_survey_answer(client_id, question, answer):
+    conn = sqlite3.connect("marketing.db")
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO survey_results (client_id, question, answer, date)
+        VALUES (?, ?, ?, ?)
+    """, (client_id, question, answer, datetime.now().strftime("%Y-%m-%d")))
+    conn.commit()
+    conn.close()
+
+def get_survey_results_df():
+    conn = sqlite3.connect("marketing.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT c.name, s.question, s.answer, s.date
+        FROM survey_results s
+        JOIN clients c ON s.client_id = c.id
+        ORDER BY s.date DESC
+    """)
+    data = c.fetchall()
+    conn.close()
+    return pd.DataFrame(data, columns=["Клиент", "Вопрос", "Ответ", "Дата"])
+
 
 # --- Инициализация ---
 init_db()
 load_default_services()
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "👥 Клиенты", "📚 Услуги", "📝 Заявки", "📈 Аналитика", "📣 Эффективность рекламы"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "👥 Клиенты", "📚 Услуги", "📝 Заявки", "📈 Аналитика", "📣 Эффективность рекламы", "📋 Опросы", "📊 Статистика"
 ])
 
 # --- Вкладка "Клиенты" ---
@@ -394,7 +431,7 @@ with tab4:
     st.metric("🌍 Клиенты из регионов", regions)
     st.metric("🔁 Повторные клиенты", repeat)
 
-    st.subheader("📊 Источники привлечения клиентов")
+    st.subheader("Источники привлечения клиентов")
     st.bar_chart(source_stats)
 
 
@@ -412,10 +449,105 @@ with tab5:
             st.success("✅ Кампания добавлена")
 
     ad_stats_df = get_ad_stats_df()
-    st.subheader("📋 Сводка по кампаниям")
+    st.subheader("Сводка по кампаниям")
     st.dataframe(ad_stats_df, use_container_width=True)
 
     if not ad_stats_df.empty:
-        st.subheader("📊 Средняя эффективность по каналам")
+        st.subheader("Средняя эффективность по каналам")
         chart_data = ad_stats_df.groupby("Канал").mean(numeric_only=True)["Эффективность (ЗР/ДП)"]
         st.bar_chart(chart_data)
+
+with tab6:
+    st.header("Проведение опросов")
+
+    clients = get_clients()
+    if not clients:
+        st.warning("Нет клиентов для проведения опроса.")
+    else:
+        client_map = {f"{c[1]} ({c[3]}, {c[4]})": c for c in clients}
+
+        client_choice = st.selectbox(
+            "Клиент",
+            list(client_map.keys()),
+            key="survey_client_selectbox"  # <- вот он
+        )
+        client = client_map[client_choice]
+
+        st.subheader("Вопросы для опроса")
+
+        questions = [
+            "Насколько вы удовлетворены качеством услуг? (1-5)",
+            "Как вы узнали о нас?",
+            "Готовы ли вы рекомендовать нас другим?",
+        ]
+
+        answers = {}
+        for question in questions:
+            answers[question] = st.text_input(f"{question}")
+
+        if st.button("Сохранить ответы"):
+            for q, a in answers.items():
+                if a.strip():  # сохраняем только заполненные
+                    add_survey_answer(client[0], q, a.strip())
+            st.success("✅ Ответы сохранены")
+
+    st.subheader("📊 Результаты опросов")
+    survey_df = get_survey_results_df()
+    if survey_df.empty:
+        st.info("Опросов пока нет.")
+    else:
+        # Преобразуем таблицу:
+        pivot_df = survey_df.pivot_table(
+            index=["Клиент"],  # Одна строка — один клиент
+            columns="Вопрос",
+            values="Ответ",
+            aggfunc="first"  # если несколько раз ответил — берём первый ответ
+        ).reset_index()
+
+        # Показываем красиво:
+        st.dataframe(pivot_df, use_container_width=True)
+
+with tab7:
+    st.header("📊 Статистическая обработка данных")
+
+    ad_stats_df = get_ad_stats_df()
+
+    if ad_stats_df.empty:
+        st.info("Нет данных по рекламным кампаниям для анализа.")
+    else:
+        st.write("Данные по рекламным кампаниям:")
+        st.dataframe(ad_stats_df[["Канал", "Затраты (₽)", "Доход (₽)"]], use_container_width=True)
+
+        # Извлекаем данные для анализа
+        x = ad_stats_df["Затраты (₽)"].values
+        y = ad_stats_df["Доход (₽)"].values
+
+        # Корреляция Пирсона
+        pearson_corr, pearson_p = stats.pearsonr(x, y)
+        # Корреляция Спирмена
+        spearman_corr, spearman_p = stats.spearmanr(x, y)
+
+        st.subheader("📈 Корреляционный анализ")
+        st.write(f"**Коэффициент корреляции Пирсона:** {pearson_corr:.3f} (p-value = {pearson_p:.3f})")
+        st.write(f"**Коэффициент корреляции Спирмена:** {spearman_corr:.3f} (p-value = {spearman_p:.3f})")
+
+        # Простейший регрессионный анализ
+        X = x.reshape(-1, 1)
+        model = LinearRegression()
+        model.fit(X, y)
+        y_pred = model.predict(X)
+
+        st.subheader("📉 Регрессионный анализ")
+        st.write(f"**Уравнение регрессии:** Доход = {model.coef_[0]:.2f} * Затраты + {model.intercept_:.2f}")
+        st.write(f"**R² (коэффициент детерминации):** {model.score(X, y):.3f}")
+
+        # Визуализация
+        st.subheader("📊 Визуализация регрессии")
+        fig, ax = plt.subplots()
+        ax.scatter(x, y, label="Фактические данные", color='blue')
+        ax.plot(x, y_pred, color='red', label="Линия регрессии")
+        ax.set_xlabel("Затраты (₽)")
+        ax.set_ylabel("Доход (₽)")
+        ax.set_title("Зависимость дохода от затрат")
+        ax.legend()
+        st.pyplot(fig)
